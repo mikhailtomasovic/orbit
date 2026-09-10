@@ -919,8 +919,8 @@ def chord_to_pynput(chord: str) -> str:
 def start_hotkeys(rot: Rotator) -> Any:
     try:
         from pynput.keyboard import GlobalHotKeys
-    except ImportError:
-        log("sys", "pynput not installed — hotkeys disabled. pip install pynput")
+    except ImportError as exc:
+        log("sys", f"hotkeys off — {exc}. In the Orbit venv: pip install pynput")
         return None
 
     def bind(action: str):
@@ -1127,6 +1127,13 @@ def venv_python() -> Path:
     return VENV / "bin" / "python"
 
 
+def in_orbit_venv() -> bool:
+    try:
+        return Path(sys.prefix).resolve() == VENV.resolve()
+    except OSError:
+        return False
+
+
 def ensure_venv() -> Path:
     py = venv_python()
     if py.exists():
@@ -1294,8 +1301,8 @@ def cmd_install(dry: bool) -> int:
     ensure_system_packages()
     py = ensure_venv()
     ensure_pynput(py)
-    if Path(sys.executable).resolve() != py.resolve():
-        print(f"python        {py}")
+    if not in_orbit_venv():
+        print(f"python        switching to {py}")
         os.execv(str(py), [str(py), str(dest_py), *sys.argv[1:]])
 
     shortcut = write_desktop_launcher(dest_py, py)
