@@ -29,6 +29,7 @@ Requires Python 3.10+. pynput is optional and only needed for hotkeys.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -48,6 +49,7 @@ from typing import Any, Protocol
 
 APP = "orbit"
 HOME = Path(os.environ.get("ORBIT_HOME", Path.home() / ".orbit"))
+VENV = HOME / "venv"
 LOCK_PATH = HOME / "orbit.pid"
 STATUS_PATH = HOME / "status.json"
 LOG_PATH = HOME / "orbit.log"
@@ -497,21 +499,21 @@ def run(cmd: list[str], timeout: int = 45) -> subprocess.CompletedProcess[str]:
 
 
 class ProtonOfficial:
-    name = "protonvpn-cli"
+    name = "protonvpn"
+
+    def _bin(self) -> str:
+        return which("protonvpn") or which("protonvpn-cli") or "protonvpn"
 
     def connect(self, server: Server) -> None:
-        binary = which("protonvpn-cli") or "protonvpn-cli"
-        r = run([binary, "connect", server.id])
+        r = run([self._bin(), "connect", server.id])
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "connect failed")
 
     def disconnect(self) -> None:
-        binary = which("protonvpn-cli") or "protonvpn-cli"
-        run([binary, "disconnect"])
+        run([self._bin(), "disconnect"])
 
     def status_text(self) -> str:
-        binary = which("protonvpn-cli") or "protonvpn-cli"
-        r = run([binary, "status"], timeout=20)
+        r = run([self._bin(), "status"], timeout=20)
         return (r.stdout or r.stderr).strip()
 
 
@@ -648,15 +650,32 @@ def has_tunnel_files(cfg: Config, suffix: str) -> bool:
     return False
 
 
+def proton_cli() -> str | None:
+    return which("protonvpn") or which("protonvpn-cli")
+
+
+def proton_signed_in() -> bool:
+    binary = proton_cli()
+    if not binary:
+        return False
+    r = subprocess.run([binary, "status"], capture_output=True, text=True, timeout=20)
+    text = f"{r.stdout} {r.stderr}".lower()
+    if any(s in text for s in ("signin", "sign in", "authentication required", "not logged", "please log")):
+        return False
+    return r.returncode == 0
+
+
 def pick_backend(cfg: Config, dry: bool) -> Backend:
     if dry:
         return DryRun()
     kind = cfg.backend
     if kind == "auto":
-        if which("protonvpn-cli"):
-            kind = "protonvpn-cli"
-        elif which("protonvpn"):
-            kind = "protonvpn-community"
+        if proton_cli():
+            if proton_signed_in():
+                kind = "protonvpn-cli"
+            else:
+                log("sys", f"{proton_cli()} installed — sign in with: protonvpn signin")
+                kind = ""
         elif (which("wg-quick") or which("wireguard")) and has_tunnel_files(cfg, ".conf"):
             kind = "wireguard"
         elif (which("openvpn") or which("openvpn-gui")) and has_tunnel_files(cfg, ".ovpn"):
@@ -666,7 +685,7 @@ def pick_backend(cfg: Config, dry: bool) -> Backend:
         if not kind:
             log("sys", "no Proton tunnel yet — dry-run prototype (hops are logged, no VPN)")
             return DryRun()
-    if kind == "protonvpn-cli":
+    if kind in ("protonvpn-cli", "protonvpn"):
         return ProtonOfficial()
     if kind == "protonvpn-community":
         return ProtonCommunity()
@@ -1052,8 +1071,8 @@ def cmd_bootstrap(cfg: Config) -> int:
     print(f"tunnels       {cfg.tunnels_dir}")
     print(f"python        {sys.version.split()[0]}")
     print(f"platform      {cfg.platform} (os={os.name})")
-    print(f"protonvpn-cli {which('protonvpn-cli') or 'missing'}")
     print(f"protonvpn     {which('protonvpn') or 'missing'}")
+    print(f"protonvpn-cli {which('protonvpn-cli') or 'missing'}")
     print(f"wg-quick      {which('wg-quick') or 'missing'}")
     print(f"wireguard     {which('wireguard') or 'missing'}")
     print(f"openvpn       {which('openvpn') or which('openvpn-gui') or 'missing'}")
@@ -1062,7 +1081,10 @@ def cmd_bootstrap(cfg: Config) -> int:
 
         print("pynput        ok")
     except ImportError:
-        print("pynput        missing  (optional: pip install pynput)")
+        print("pynput        missing")
+
+    if proton_cli() and not proton_signed_in():
+        print("signin        run:  protonvpn signin")
 
     missing: list[str] = []
     seen: set[str] = set()
@@ -1094,7 +1116,102 @@ def desktop_dir() -> Path | None:
     return None
 
 
-def write_desktop_launcher(py_path: Path) -> Path | None:
+def sudo_run(cmd: list[str], timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    print(f"deps          {' '.join(cmd)}")
+    return subprocess.run(cmd, env=env, timeout=timeout)
+
+
+def venv_python() -> Path:
+    if os.name == "nt":
+        return VENV / "Scripts" / "python.exe"
+    return VENV / "bin" / "python"
+
+
+def ensure_venv() -> Path:
+    py = venv_python()
+    if py.exists():
+        return py
+    print(f"deps          creating venv {VENV}")
+    r = subprocess.run([sys.executable, "-m", "venv", str(VENV)])
+    if r.returncode != 0 or not py.exists():
+        if which("apt-get"):
+            ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+            sudo_run(["sudo", "apt-get", "install", "-y", "python3-venv", f"python{ver}-venv", "python3-pip"])
+            subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=False)
+        if not py.exists():
+            raise SystemExit("Could not create a Python venv. Install python3-venv and retry.")
+    return py
+
+
+def ensure_pynput(py: Path) -> None:
+    probe = subprocess.run([str(py), "-c", "import pynput"], capture_output=True)
+    if probe.returncode == 0:
+        print("deps          pynput ok")
+        return
+    print("deps          pip install pynput")
+    r = subprocess.run([str(py), "-m", "pip", "install", "--quiet", "pynput"])
+    if r.returncode != 0:
+        print("deps          pynput install failed — hotkeys will stay off")
+
+
+def ensure_proton_apt_repo() -> bool:
+    lists = Path("/etc/apt/sources.list.d")
+    if lists.exists() and any("protonvpn" in p.name for p in lists.glob("*")):
+        return True
+    url = "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.8_all.deb"
+    expected = "0b14e71586b22e498eb20926c48c7b434b751149b1f2af9902ef1cfe6b03e180"
+    dest = HOME / "protonvpn-stable-release_1.0.8_all.deb"
+    print("deps          Proton apt repo")
+    try:
+        urllib.request.urlretrieve(url, dest)
+    except Exception as exc:
+        print(f"deps          repo download failed: {exc}")
+        return False
+    digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+    if digest != expected:
+        print("deps          repo checksum mismatch — skip Proton CLI repo")
+        return False
+    r = sudo_run(["sudo", "dpkg", "-i", str(dest)])
+    if r.returncode != 0:
+        return False
+    sudo_run(["sudo", "apt-get", "update"])
+    return True
+
+
+def ensure_system_packages() -> None:
+    if os.name == "nt":
+        print("deps          Windows: install WireGuard from https://www.wireguard.com/install/")
+        return
+    if proton_cli() and which("wg-quick"):
+        print("deps          Proton CLI + WireGuard already present")
+        return
+    if which("apt-get"):
+        ensure_proton_apt_repo()
+        sudo_run(["sudo", "apt-get", "install", "-y", "wireguard"])
+        if not proton_cli():
+            r = sudo_run(["sudo", "apt-get", "install", "-y", "proton-vpn-cli"])
+            if r.returncode != 0:
+                print("deps          proton-vpn-cli not available — hops stay dry-run until it is")
+        return
+    if which("dnf"):
+        pkgs = ["wireguard-tools"]
+        if not proton_cli():
+            pkgs.append("proton-vpn-cli")
+        sudo_run(["sudo", "dnf", "install", "-y", *pkgs])
+        return
+    if which("pacman"):
+        pkgs = ["wireguard-tools"]
+        if not proton_cli():
+            pkgs.append("proton-vpn-cli")
+        sudo_run(["sudo", "pacman", "-S", "--noconfirm", *pkgs])
+        return
+    print("deps          unknown distro — install Proton CLI and WireGuard yourself")
+
+
+def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Path | None:
+    interp = str(interpreter) if interpreter else ("python" if os.name == "nt" else "python3")
     desk = desktop_dir()
     if os.name == "nt":
         if not desk:
@@ -1106,8 +1223,7 @@ def write_desktop_launcher(py_path: Path) -> Path | None:
                     "@echo off",
                     "setlocal",
                     f'cd /d "{HOME}"',
-                    "where py >nul 2>&1 && (set PY=py -3) || (set PY=python)",
-                    f'%PY% "{py_path}"',
+                    f'"{interp}" "{py_path}"',
                     "if errorlevel 1 pause",
                     "",
                 ]
@@ -1117,7 +1233,7 @@ def write_desktop_launcher(py_path: Path) -> Path | None:
         return bat
     if sys.platform == "darwin":
         target = (desk or Path.home()) / "Orbit.command"
-        target.write_text(f'#!/bin/bash\ncd "{HOME}"\nexec python3 "{py_path}"\n', encoding="utf-8")
+        target.write_text(f'#!/bin/bash\ncd "{HOME}"\nexec "{interp}" "{py_path}"\n', encoding="utf-8")
         target.chmod(0o755)
         return target
     apps = Path.home() / ".local" / "share" / "applications"
@@ -1130,7 +1246,7 @@ def write_desktop_launcher(py_path: Path) -> Path | None:
                 "Type=Application",
                 "Name=Orbit",
                 "Comment=ProtonVPN rotator",
-                f"Exec=python3 {py_path}",
+                f'Exec="{interp}" "{py_path}"',
                 "Terminal=true",
                 "Categories=Network;",
                 "",
@@ -1157,7 +1273,15 @@ def cmd_install(dry: bool) -> int:
     elif not dest_yaml.exists():
         dest_yaml.write_text(BUNDLED_YAML, encoding="utf-8")
     os.environ["ORBIT_CONFIG"] = str(dest_yaml)
-    shortcut = write_desktop_launcher(dest_py)
+
+    ensure_system_packages()
+    py = ensure_venv()
+    ensure_pynput(py)
+    if Path(sys.executable).resolve() != py.resolve():
+        print(f"python        {py}")
+        os.execv(str(py), [str(py), str(dest_py), *sys.argv[1:]])
+
+    shortcut = write_desktop_launcher(dest_py, py)
     if shortcut:
         print(f"shortcut      {shortcut}")
     cfg = load_cfg(dest_yaml)
