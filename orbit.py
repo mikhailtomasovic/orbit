@@ -1806,7 +1806,26 @@ def ensure_system_packages() -> None:
     print("deps          unknown distro — install Proton CLI and WireGuard yourself")
 
 
-def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Path | None:
+def install_icon(src: Path) -> Path | None:
+    dest = HOME / "orbit.png"
+    candidates = [
+        src.parent / "assets" / "orbit-256.png",
+        src.parent / "assets" / "orbit.png",
+        src.parent / "orbit.png",
+        dest,
+    ]
+    icon = next((p for p in candidates if p.exists()), None)
+    if not icon:
+        return None
+    if icon.resolve() != dest.resolve():
+        shutil.copy2(icon, dest)
+    for folder, name in (
+        (Path.home() / ".local" / "share" / "icons" / "hicolor" / "256x256" / "apps", "orbit.png"),
+        (Path.home() / ".local" / "share" / "pixmaps", "orbit.png"),
+    ):
+        folder.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dest, folder / name)
+    return dest
     interp = str(interpreter) if interpreter else ("python" if os.name == "nt" else "python3")
     desk = desktop_dir()
     if os.name == "nt":
@@ -1835,6 +1854,8 @@ def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Pa
     apps = Path.home() / ".local" / "share" / "applications"
     apps.mkdir(parents=True, exist_ok=True)
     desktop = apps / "orbit.desktop"
+    icon = HOME / "orbit.png"
+    icon_line = f"Icon={icon}" if icon.exists() else "Icon=orbit"
     desktop.write_text(
         "\n".join(
             [
@@ -1843,8 +1864,11 @@ def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Pa
                 "Name=Orbit",
                 "Comment=ProtonVPN rotator",
                 f'Exec="{interp}" "{py_path}" gui',
+                icon_line,
                 "Terminal=false",
-                "Categories=Network;",
+                "StartupNotify=true",
+                "Categories=Network;Security;",
+                "Keywords=vpn;proton;wireguard;",
                 "",
             ]
         ),
@@ -1862,6 +1886,9 @@ def cmd_install(dry: bool) -> int:
     dest_py = HOME / "orbit.py"
     if src != dest_py:
         shutil.copy2(src, dest_py)
+    icon = install_icon(src)
+    if icon:
+        print(f"icon          {icon}")
     sibling = src.parent / "orbit.yaml"
     dest_yaml = HOME / "orbit.yaml"
     if sibling.exists() and sibling.resolve() != dest_yaml.resolve():
