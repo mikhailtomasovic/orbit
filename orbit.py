@@ -1467,8 +1467,32 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
         side="left", padx=(0, 8)
     )
     ttk.Radiobutton(clock_row, text="Set interval", variable=clock_mode, value="fixed", command=nudge_clock).pack(
-        side="left"
+        side="left", padx=(0, 8)
     )
+
+    def test_timer() -> None:
+        def _run() -> None:
+            if not rot.cfg.schedule_enabled:
+                log("clock", "FAIL  turn Timed hops on first")
+                return
+            saved = rot.cfg.min_hop_seconds
+            rot.cfg.min_hop_seconds = 0
+            try:
+                before = rot.next_due
+                time.sleep(0.25)
+                rot.hop("key", 1)
+                time.sleep(0.55)
+                after = rot.next_due
+            finally:
+                rot.cfg.min_hop_seconds = saved
+            if after != before and after > time.monotonic():
+                log("clock", f"PASS  GUI hop reset timer  {before:.1f} → {after:.1f}")
+            else:
+                log("clock", f"FAIL  timer did not reset  {before:.1f} → {after:.1f}")
+
+        bg_call(_run)
+
+    ttk.Button(clock_row, text="Test timer", command=test_timer).pack(side="left")
 
     scale_row = ttk.Frame(outer, style="TFrame")
     scale_row.pack(fill="x", pady=(6, 0))
