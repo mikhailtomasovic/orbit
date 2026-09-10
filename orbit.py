@@ -937,8 +937,10 @@ class Rotator:
     lock: threading.Lock = field(default_factory=threading.Lock)
     current: Server | None = None
     last_hop: float = 0.0
+    next_due: float = 0.0
     skipped: dict[str, float] = field(default_factory=dict)
     stop: threading.Event = field(default_factory=threading.Event)
+    clock_wake: threading.Event = field(default_factory=threading.Event)
 
     def pool(self) -> Pool:
         for p in self.cfg.pools:
@@ -1065,10 +1067,30 @@ def clock_loop(rot: Rotator) -> None:
         ),
     )
     while not rot.stop.is_set():
+        if not rot.cfg.schedule_enabled:
+            rot.next_due = 0.0
+            if rot.stop.wait(0.4):
+                break
+            rot.clock_wake.wait(0.4)
+            rot.clock_wake.clear()
+            continue
         wait = next_wait_seconds(rot.cfg)
+        rot.next_due = time.monotonic() + wait
         log("clock", f"next hop in {wait:.0f}s")
-        if rot.stop.wait(wait):
-            break
+        aborted = False
+        while time.monotonic() < rot.next_due:
+            left = min(0.4, max(0.05, rot.next_due - time.monotonic()))
+            if rot.stop.wait(left):
+                return
+            if rot.clock_wake.is_set():
+                rot.clock_wake.clear()
+                aborted = True
+                break
+            if not rot.cfg.schedule_enabled:
+                aborted = True
+                break
+        if aborted:
+            continue
         if in_quiet_hours(rot.cfg):
             log("clock", "quiet hours — skip")
             continue
@@ -1228,8 +1250,7 @@ def spawn_rotator(cfg: Config, dry: bool) -> tuple[Rotator, Any]:
     rot = Rotator(cfg=cfg, backend=pick_backend(cfg, dry))
     log("sys", f"backend={rot.backend.name}  pool={rot.pool().name}  n={len(rot.pool().servers)}")
     rot.hop("start")
-    if cfg.schedule_enabled:
-        threading.Thread(target=clock_loop, args=(rot,), daemon=True, name="clock").start()
+    threading.Thread(target=clock_loop, args=(rot,), daemon=True, name="clock").start()
     if cfg.sentinel_enabled and cfg.probes:
         threading.Thread(target=sentinel_loop, args=(rot,), daemon=True, name="sentinel").start()
     listener = start_hotkeys(rot) if cfg.hotkeys_enabled else None
@@ -1358,6 +1379,60 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
     for pool in rot.cfg.pools:
         ttk.Button(pools, text=pool.name, command=lambda n=pool.name: set_pool(n)).pack(side="left", padx=(0, 8))
 
+    ttk.Label(outer, text="CLOCK", style="Muted.TLabel").pack(anchor="w", pady=(18, 6))
+    clock_row = ttk.Frame(outer, style="TFrame")
+    clock_row.pack(fill="x")
+    clock_on = tk.BooleanVar(value=rot.cfg.schedule_enabled)
+    clock_mode = tk.StringVar(value=rot.cfg.interval_mode)
+    eta_var = tk.StringVar(value="…")
+    style.configure("TCheckbutton", background=bg, foreground=fg, font=(family, 10))
+    style.configure("TRadiobutton", background=bg, foreground=fg, font=(family, 10))
+
+    def nudge_clock() -> None:
+        rot.cfg.schedule_enabled = bool(clock_on.get())
+        rot.cfg.interval_mode = "random" if clock_mode.get() == "random" else "fixed"
+        rot.clock_wake.set()
+        log(
+            "clock",
+            f"{'on' if rot.cfg.schedule_enabled else 'off'}  "
+            + (
+                f"random {rot.cfg.random_min_seconds}-{rot.cfg.random_max_seconds}s"
+                if rot.cfg.interval_mode == "random"
+                else f"set {rot.cfg.interval_seconds}s"
+            ),
+        )
+
+    ttk.Checkbutton(clock_row, text="Timed hops", variable=clock_on, command=nudge_clock).pack(side="left", padx=(0, 12))
+    ttk.Radiobutton(clock_row, text="Random 15s–15m", variable=clock_mode, value="random", command=nudge_clock).pack(
+        side="left", padx=(0, 8)
+    )
+    ttk.Radiobutton(clock_row, text="Set interval", variable=clock_mode, value="fixed", command=nudge_clock).pack(
+        side="left", padx=(0, 12)
+    )
+    ttk.Label(clock_row, textvariable=eta_var, style="Muted.TLabel").pack(side="left")
+
+    scale_row = ttk.Frame(outer, style="TFrame")
+    scale_row.pack(fill="x", pady=(6, 0))
+    ttk.Label(scale_row, text="set", style="Muted.TLabel").pack(side="left")
+    fixed_var = tk.IntVar(value=rot.cfg.interval_seconds)
+
+    def on_fixed(_event: object | None = None) -> None:
+        rot.cfg.interval_seconds = max(15, min(1800, int(float(fixed_var.get()))))
+
+    ttk.Scale(scale_row, from_=15, to=1800, variable=fixed_var, command=lambda _v: on_fixed()).pack(
+        side="left", fill="x", expand=True, padx=8
+    )
+    fixed_lbl = ttk.Label(scale_row, text=f"{rot.cfg.interval_seconds}s", style="Muted.TLabel")
+    fixed_lbl.pack(side="left")
+
+    def fmt_eta() -> str:
+        if not rot.cfg.schedule_enabled:
+            return "clock off"
+        if not rot.next_due:
+            return "arming…"
+        left = max(0, int(rot.next_due - time.monotonic()))
+        return f"next hop {left // 60}:{left % 60:02d}"
+
     ttk.Label(outer, text="LOG", style="Muted.TLabel").pack(anchor="w", pady=(18, 6))
     logbox = tk.Text(
         outer,
@@ -1391,6 +1466,8 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
         else:
             current_var.set(rot.current.id if rot.current else "idle")
         detail_var.set(f"{rot.backend.name} · {rot.pool().name}")
+        eta_var.set(fmt_eta())
+        fixed_lbl.configure(text=f"{int(fixed_var.get())}s")
         root.after(200, drain)
 
     def on_close() -> None:
