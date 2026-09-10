@@ -1002,6 +1002,10 @@ class Rotator:
                 return None
             self.current = target
             self.last_hop = now
+            if self.cfg.schedule_enabled:
+                self.next_due = time.monotonic() + next_wait_seconds(self.cfg)
+            if reason != "clock":
+                self.clock_wake.set()
             write_status(
                 {
                     "server": target.id,
@@ -1010,6 +1014,7 @@ class Rotator:
                     "community": target.community,
                     "pool": self.pool().name,
                     "reason": reason,
+                    "next_due": round(self.next_due, 1) if self.next_due else 0,
                     "at": datetime.now().isoformat(timespec="seconds"),
                     "backend": getattr(self.backend, "name", ""),
                 }
@@ -1352,7 +1357,9 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
     )
     ttk.Label(outer, textvariable=current_var, style="Display.TLabel").pack(anchor="w", pady=(4, 0))
     detail_var = tk.StringVar(value=f"{rot.backend.name} · {rot.pool().name}")
-    ttk.Label(outer, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w", pady=(2, 14))
+    eta_var = tk.StringVar(value="…")
+    ttk.Label(outer, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+    ttk.Label(outer, textvariable=eta_var, style="Display.TLabel").pack(anchor="w", pady=(0, 14))
 
     btns = ttk.Frame(outer, style="TFrame")
     btns.pack(fill="x")
@@ -1384,7 +1391,6 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
     clock_row.pack(fill="x")
     clock_on = tk.BooleanVar(value=rot.cfg.schedule_enabled)
     clock_mode = tk.StringVar(value=rot.cfg.interval_mode)
-    eta_var = tk.StringVar(value="…")
     style.configure("TCheckbutton", background=bg, foreground=fg, font=(family, 10))
     style.configure("TRadiobutton", background=bg, foreground=fg, font=(family, 10))
 
@@ -1407,9 +1413,8 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
         side="left", padx=(0, 8)
     )
     ttk.Radiobutton(clock_row, text="Set interval", variable=clock_mode, value="fixed", command=nudge_clock).pack(
-        side="left", padx=(0, 12)
+        side="left"
     )
-    ttk.Label(clock_row, textvariable=eta_var, style="Muted.TLabel").pack(side="left")
 
     scale_row = ttk.Frame(outer, style="TFrame")
     scale_row.pack(fill="x", pady=(6, 0))
