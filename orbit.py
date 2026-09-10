@@ -1219,6 +1219,60 @@ def start_hotkeys(rot: Rotator) -> Any:
 # CLI
 # ---------------------------------------------------------------------------
 
+def cmd_test_clock() -> int:
+    """Dry-run: a GUI-style hop("key") must cancel the in-flight clock wait."""
+    cfg = parse_config(load_simple_yaml(BUNDLED_YAML))
+    cfg.min_hop_seconds = 0
+    cfg.schedule_enabled = True
+    cfg.interval_mode = "fixed"
+    cfg.interval_seconds = 5
+    cfg.sentinel_enabled = False
+    cfg.hotkeys_enabled = False
+    rot = Rotator(cfg=cfg, backend=DryRun())
+    reasons: list[str] = []
+    orig = Rotator.hop
+
+    def tracked(reason: str, direction: int = 1) -> Server | None:
+        reasons.append(reason)
+        return orig(rot, reason, direction)
+
+    rot.hop = tracked  # type: ignore[method-assign]
+    worker = threading.Thread(target=clock_loop, args=(rot,), daemon=True, name="clock-test")
+    worker.start()
+    for _ in range(40):
+        if rot.next_due:
+            break
+        time.sleep(0.05)
+    if not rot.next_due:
+        print("FAIL  clock never armed next_due")
+        rot.stop.set()
+        return 1
+    original_due = rot.next_due
+    time.sleep(1.0)
+    rot.hop("key", 1)
+    if reasons[:1] != ["key"]:
+        print(f"FAIL  expected first hop reason 'key', got {reasons}")
+        rot.stop.set()
+        return 1
+    time.sleep(0.5)
+    if rot.next_due <= original_due:
+        print(f"FAIL  next_due did not move forward ({original_due:.2f} -> {rot.next_due:.2f})")
+        rot.stop.set()
+        return 1
+    leftover_window = original_due + 0.35
+    while time.monotonic() < leftover_window:
+        time.sleep(0.05)
+    if "clock" in reasons:
+        print(f"FAIL  clock hopped on leftover timer  reasons={reasons}")
+        rot.stop.set()
+        return 1
+    rot.stop.set()
+    rot.clock_wake.set()
+    print("PASS  GUI hop('key') reset the clock")
+    print(f"      reasons={reasons}  due {original_due:.2f} -> {rot.next_due:.2f}")
+    return 0
+
+
 def load_cfg(path: Path) -> Config:
     if not path.exists():
         raise SystemExit(f"Missing config: {path}")
@@ -1836,6 +1890,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="Show last hop + backend status")
     sub.add_parser("nm", help="Show NetworkManager Proton / uplink / leak roles")
     sub.add_parser("probe", help="Run sentinel probes once")
+    sub.add_parser("test-clock", help="Dry-run: prove a GUI hop resets the timer")
     sub.add_parser("stop", help="Stop a running daemon")
     sub.add_parser("validate", help="Print parsed config")
     sub.add_parser("bootstrap", help="Create folders and report what the machine still needs")
@@ -1847,6 +1902,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "stop":
         return stop_daemon()
+    if args.cmd == "test-clock":
+        return cmd_test_clock()
     if args.cmd == "konsole":
         return cmd_konsole()
     if args.cmd in (None, "install"):
