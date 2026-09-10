@@ -638,6 +638,16 @@ class DryRun:
         return "dry-run"
 
 
+def has_tunnel_files(cfg: Config, suffix: str) -> bool:
+    for pool in cfg.pools:
+        for server in pool.servers:
+            stem = server.id.replace("#", "-")
+            for name in (f"{stem}{suffix}", f"{server.community}{suffix}", f"{server.id}{suffix}"):
+                if (cfg.tunnels_dir / name).exists():
+                    return True
+    return False
+
+
 def pick_backend(cfg: Config, dry: bool) -> Backend:
     if dry:
         return DryRun()
@@ -647,12 +657,14 @@ def pick_backend(cfg: Config, dry: bool) -> Backend:
             kind = "protonvpn-cli"
         elif which("protonvpn"):
             kind = "protonvpn-community"
-        elif which("wg-quick") or which("wireguard"):
+        elif (which("wg-quick") or which("wireguard")) and has_tunnel_files(cfg, ".conf"):
             kind = "wireguard"
-        elif which("openvpn") or which("openvpn-gui"):
+        elif (which("openvpn") or which("openvpn-gui")) and has_tunnel_files(cfg, ".ovpn"):
             kind = "openvpn"
         else:
-            log("sys", "no Proton backend found — dry-run prototype (hops are logged, no tunnel)")
+            kind = ""
+        if not kind:
+            log("sys", "no Proton tunnel yet — dry-run prototype (hops are logged, no VPN)")
             return DryRun()
     if kind == "protonvpn-cli":
         return ProtonOfficial()
