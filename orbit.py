@@ -1292,7 +1292,7 @@ def cmd_install(dry: bool) -> int:
         shutil.copy2(src, dest_py)
     sibling = src.parent / "orbit.yaml"
     dest_yaml = HOME / "orbit.yaml"
-    if sibling.exists():
+    if sibling.exists() and sibling.resolve() != dest_yaml.resolve():
         shutil.copy2(sibling, dest_yaml)
     elif not dest_yaml.exists():
         dest_yaml.write_text(BUNDLED_YAML, encoding="utf-8")
