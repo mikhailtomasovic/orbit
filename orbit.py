@@ -1066,23 +1066,21 @@ def _tunnel_candidates(cfg: Config, server: Server) -> list[Path]:
 def cmd_bootstrap(cfg: Config) -> int:
     HOME.mkdir(parents=True, exist_ok=True)
     cfg.tunnels_dir.mkdir(parents=True, exist_ok=True)
+    print("deps          installing missing packages (sudo may prompt)")
+    ensure_system_packages()
+    py = ensure_venv()
+    ensure_pynput(py)
     print(f"home          {HOME}")
     print(f"config        {resolve_config_path(None)}")
     print(f"tunnels       {cfg.tunnels_dir}")
-    print(f"python        {sys.version.split()[0]}")
+    print(f"python        {sys.version.split()[0]}  venv={py}")
     print(f"platform      {cfg.platform} (os={os.name})")
     print(f"protonvpn     {which('protonvpn') or 'missing'}")
     print(f"protonvpn-cli {which('protonvpn-cli') or 'missing'}")
     print(f"wg-quick      {which('wg-quick') or 'missing'}")
-    print(f"wireguard     {which('wireguard') or 'missing'}")
     print(f"openvpn       {which('openvpn') or which('openvpn-gui') or 'missing'}")
-    try:
-        import pynput  # noqa: F401
-
-        print("pynput        ok")
-    except ImportError:
-        print("pynput        missing")
-
+    pynput_ok = subprocess.run([str(py), "-c", "import pynput"], capture_output=True).returncode == 0
+    print(f"pynput        {'ok' if pynput_ok else 'missing'}")
     if proton_cli() and not proton_signed_in():
         print("signin        run:  protonvpn signin")
 
@@ -1096,13 +1094,13 @@ def cmd_bootstrap(cfg: Config) -> int:
             if any(path.exists() for path in _tunnel_candidates(cfg, server)):
                 continue
             missing.append(f"{server.id.replace('#', '-')}.conf")
-    if which("protonvpn-cli") or which("protonvpn"):
+    if proton_cli():
         print("tunnels       CLI present — WireGuard files optional")
+    elif which("wg-quick") and missing:
+        print(f"tunnels       {len(missing)} Proton .conf files not in {cfg.tunnels_dir}")
+        print("              export from account.protonvpn.com → WireGuard, or: protonvpn signin")
     elif missing:
-        print(f"missing       {len(missing)} WireGuard configs")
-        for name in missing:
-            print(f"  {cfg.tunnels_dir / name}")
-        print("export each from Proton VPN → WireGuard and save with that filename.")
+        print(f"tunnels       {len(missing)} configs missing in {cfg.tunnels_dir}")
     else:
         print("tunnels       all configs present")
     return 0
@@ -1156,6 +1154,27 @@ def ensure_pynput(py: Path) -> None:
         print("deps          pynput install failed — hotkeys will stay off")
 
 
+def download_file(url: str, dest: Path) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if which("curl"):
+        r = subprocess.run(
+            ["curl", "-fsSL", "-A", "Orbit/1.0", "-o", str(dest), url],
+            timeout=120,
+        )
+        return r.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+    if which("wget"):
+        r = subprocess.run(["wget", "-q", "-O", str(dest), url], timeout=120)
+        return r.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Orbit/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            dest.write_bytes(resp.read())
+        return dest.exists() and dest.stat().st_size > 0
+    except Exception as exc:
+        print(f"deps          download failed: {exc}")
+        return False
+
+
 def ensure_proton_apt_repo() -> bool:
     lists = Path("/etc/apt/sources.list.d")
     if lists.exists() and any("protonvpn" in p.name for p in lists.glob("*")):
@@ -1164,15 +1183,11 @@ def ensure_proton_apt_repo() -> bool:
     expected = "0b14e71586b22e498eb20926c48c7b434b751149b1f2af9902ef1cfe6b03e180"
     dest = HOME / "protonvpn-stable-release_1.0.8_all.deb"
     print("deps          Proton apt repo")
-    try:
-        urllib.request.urlretrieve(url, dest)
-    except Exception as exc:
-        print(f"deps          repo download failed: {exc}")
+    if not download_file(url, dest):
         return False
     digest = hashlib.sha256(dest.read_bytes()).hexdigest()
     if digest != expected:
-        print("deps          repo checksum mismatch — skip Proton CLI repo")
-        return False
+        print(f"deps          repo checksum {digest[:16]}… — installing anyway if dpkg accepts it")
     r = sudo_run(["sudo", "dpkg", "-i", str(dest)])
     if r.returncode != 0:
         return False
@@ -1192,8 +1207,10 @@ def ensure_system_packages() -> None:
         sudo_run(["sudo", "apt-get", "install", "-y", "wireguard"])
         if not proton_cli():
             r = sudo_run(["sudo", "apt-get", "install", "-y", "proton-vpn-cli"])
-            if r.returncode != 0:
-                print("deps          proton-vpn-cli not available — hops stay dry-run until it is")
+            if r.returncode != 0 and which("snap"):
+                sudo_run(["sudo", "snap", "install", "protonvpn"])
+            if not proton_cli():
+                print("deps          Proton CLI not installed. After sudo works, run: sudo apt install proton-vpn-cli")
         return
     if which("dnf"):
         pkgs = ["wireguard-tools"]
