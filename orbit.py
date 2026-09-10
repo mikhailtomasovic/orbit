@@ -56,8 +56,8 @@ STATUS_PATH = HOME / "status.json"
 LOG_PATH = HOME / "orbit.log"
 
 BUNDLED_YAML = r"""# Orbit — ProtonVPN rotator
-# Levant by default (Beirut and Tehran preferred). Eurasia is a second pool.
-# US exits are opt-in: Los Angeles, CA and Denver, CO only.
+# Cities verified against protonvpn countries/cities on Gotovuim.
+# Iran is not on Proton. Russia is Moscow only. US opt-in: LA and Denver.
 
 backend: auto
 tunnels_dir: "~/.orbit/tunnels"
@@ -69,48 +69,54 @@ pools:
   - name: "Levant"
     mode: round-robin
     servers:
-      - id: "LB#1"
-        community: "LB-BEY#1"
-      - id: "LB#2"
-        community: "LB-BEY#2"
-      - id: "IR#1"
-        community: "IR-THR#1"
-      - id: "IR#2"
-        community: "IR-THR#2"
-      - id: "SY#1"
-        community: "SY-DAM#1"
-      - id: "EG#3"
-        community: "EG-CAI#3"
-      - id: "MA#2"
-        community: "MA-CAS#2"
-      - id: "MA#4"
-        community: "MA-RAB#4"
-      - id: "AE#2"
-        community: "AE-DXB#2"
+      - id: "LB-BEY"
+        city: "Beirut"
+        country: "LB"
+      - id: "SY-DAM"
+        city: "Damascus"
+        country: "SY"
+      - id: "EG-CAI"
+        city: "Cairo"
+        country: "EG"
+      - id: "MA-CAS"
+        city: "Casablanca"
+        country: "MA"
+      - id: "MA-RAB"
+        city: "Rabat"
+        country: "MA"
+      - id: "AE-DXB"
+        city: "Dubai"
+        country: "AE"
   - name: "Eurasia"
     mode: round-robin
     servers:
-      - id: "PL#6"
-        community: "PL-WAW#6"
-      - id: "RO#4"
-        community: "RO-BUH#4"
-      - id: "MK#1"
-        community: "MK-SKP#1"
-      - id: "RU#5"
-        community: "RU-MOW#5"
-      - id: "RU#8"
-        community: "RU-OVB#8"
-      - id: "BY#2"
-        community: "BY-MSQ#2"
-      - id: "UA#7"
-        community: "UA-IEV#7"
+      - id: "PL-WAW"
+        city: "Warsaw"
+        country: "PL"
+      - id: "RO-BUH"
+        city: "Bucharest"
+        country: "RO"
+      - id: "MK-SKP"
+        city: "Skopje"
+        country: "MK"
+      - id: "RU-MOW"
+        city: "Moscow"
+        country: "RU"
+      - id: "BY-MSQ"
+        city: "Minsk"
+        country: "BY"
+      - id: "UA-IEV"
+        city: "Kyiv"
+        country: "UA"
   - name: "Stateside"
     mode: round-robin
     servers:
-      - id: "US#88"
-        community: "US-CA#88"
-      - id: "US#27"
-        community: "US-CO#27"
+      - id: "US-LAX"
+        city: "Los Angeles"
+        country: "US"
+      - id: "US-DEN"
+        city: "Denver"
+        country: "US"
 
 schedule:
   enabled: true
@@ -299,18 +305,61 @@ def resolve_config_path(explicit: str | None) -> Path:
 @dataclass
 class Server:
     id: str
-    community: str
+    community: str = ""
+    city: str = ""
+    country: str = ""
+
+
+CITY_BY_ID = {
+    "LB#1": ("Beirut", "LB"),
+    "LB#2": ("Beirut", "LB"),
+    "LB-BEY": ("Beirut", "LB"),
+    "SY#1": ("Damascus", "SY"),
+    "SY-DAM": ("Damascus", "SY"),
+    "EG#3": ("Cairo", "EG"),
+    "EG-CAI": ("Cairo", "EG"),
+    "MA#2": ("Casablanca", "MA"),
+    "MA-CAS": ("Casablanca", "MA"),
+    "MA#4": ("Rabat", "MA"),
+    "MA-RAB": ("Rabat", "MA"),
+    "AE#2": ("Dubai", "AE"),
+    "AE-DXB": ("Dubai", "AE"),
+    "PL#6": ("Warsaw", "PL"),
+    "PL-WAW": ("Warsaw", "PL"),
+    "RO#4": ("Bucharest", "RO"),
+    "RO-BUH": ("Bucharest", "RO"),
+    "MK#1": ("Skopje", "MK"),
+    "MK-SKP": ("Skopje", "MK"),
+    "RU#5": ("Moscow", "RU"),
+    "RU-MOW": ("Moscow", "RU"),
+    "BY#2": ("Minsk", "BY"),
+    "BY-MSQ": ("Minsk", "BY"),
+    "UA#7": ("Kyiv", "UA"),
+    "UA-IEV": ("Kyiv", "UA"),
+    "US#88": ("Los Angeles", "US"),
+    "US-LAX": ("Los Angeles", "US"),
+    "US#27": ("Denver", "US"),
+    "US-DEN": ("Denver", "US"),
+}
+
+DROPPED_IDS = {"IR#1", "IR#2", "IR-THR", "RU#8", "RU-OVB"}
 
 
 def is_allowed_exit(server: Server) -> bool:
-    """US hops are opt-in: Los Angeles (US-CA / US#88) and Denver (US-CO / US#27) only."""
+    """US hops are opt-in: Los Angeles and Denver only. Iran is not on Proton."""
+    if server.id.upper() in DROPPED_IDS:
+        return False
+    country = (server.country or "").upper()
+    city = (server.city or "").lower()
     compact = f"{server.id} {server.community}".upper().replace(" ", "")
-    looks_us = compact.startswith("US#") or compact.startswith("US-")
+    looks_us = country in {"US", "USA"} or compact.startswith("US#") or compact.startswith("US-")
     if not looks_us:
         return True
-    if server.id.upper() in {"US#88", "US#27"}:
+    if city in {"los angeles", "denver"}:
         return True
-    return "US-CA" in compact or "US-CO" in compact
+    if server.id.upper() in {"US#88", "US#27", "US-LAX", "US-DEN"}:
+        return True
+    return "US-CA" in compact or "US-CO" in compact or "LOS ANGELES" in compact or "DENVER" in compact
 
 
 @dataclass
@@ -365,10 +414,26 @@ def _interval_seconds(schedule: dict[str, Any]) -> int:
 def parse_config(raw: dict[str, Any]) -> Config:
     pools: list[Pool] = []
     for p in raw.get("pools") or []:
-        servers = [
-            Server(id=str(s.get("id")), community=str(s.get("community") or s.get("id")))
-            for s in (p.get("servers") or [])
-        ]
+        servers = []
+        for s in p.get("servers") or []:
+            sid = str(s.get("id") or "")
+            if sid.upper() in DROPPED_IDS:
+                continue
+            city = str(s.get("city") or "")
+            country = str(s.get("country") or "")
+            if not city or not country:
+                mapped = CITY_BY_ID.get(sid.upper()) or CITY_BY_ID.get(sid)
+                if mapped:
+                    city = city or mapped[0]
+                    country = country or mapped[1]
+            servers.append(
+                Server(
+                    id=sid,
+                    community=str(s.get("community") or sid),
+                    city=city,
+                    country=country,
+                )
+            )
         servers = [s for s in servers if is_allowed_exit(s)]
         pools.append(Pool(name=str(p.get("name")), mode=str(p.get("mode") or "round-robin"), servers=servers))
     schedule = raw.get("schedule") or {}
@@ -643,7 +708,14 @@ class ProtonOfficial:
                 raise RuntimeError(r.stderr.strip() or r.stdout.strip() or f"nmcli up {profile.name} failed")
             log("link", f"nmcli up {profile.name}")
         else:
-            r = run([self._bin(), "connect", server.id], timeout=60)
+            cmd = [self._bin(), "connect"]
+            if server.city:
+                cmd += ["--city", server.city]
+            elif server.country:
+                cmd += ["--country", server.country]
+            else:
+                cmd.append(server.id)
+            r = run(cmd, timeout=60)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "connect failed")
         if which("nmcli") and not wait_device("proton0"):
@@ -917,8 +989,9 @@ class Rotator:
             except RuntimeError as exc:
                 log("sys", str(exc))
                 return None
-            prev = self.current.id if self.current else "idle"
-            log("hop", f"{prev} → {target.id}  ({reason})")
+            prev = self.current.city or self.current.id if self.current else "idle"
+            dest = target.city or target.id
+            log("hop", f"{prev} → {dest}  ({reason})")
             try:
                 self.backend.connect(target)
             except Exception as exc:
@@ -930,6 +1003,8 @@ class Rotator:
             write_status(
                 {
                     "server": target.id,
+                    "city": target.city,
+                    "country": target.country,
                     "community": target.community,
                     "pool": self.pool().name,
                     "reason": reason,
@@ -1251,7 +1326,9 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
     outer.pack(fill="both", expand=True, padx=20, pady=18)
 
     ttk.Label(outer, text="ORBIT", style="Muted.TLabel").pack(anchor="w")
-    current_var = tk.StringVar(value=rot.current.id if rot.current else "idle")
+    current_var = tk.StringVar(
+        value=(f"{rot.current.city} ({rot.current.country})" if rot.current and rot.current.city else (rot.current.id if rot.current else "idle"))
+    )
     ttk.Label(outer, textvariable=current_var, style="Display.TLabel").pack(anchor="w", pady=(4, 0))
     detail_var = tk.StringVar(value=f"{rot.backend.name} · {rot.pool().name}")
     ttk.Label(outer, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w", pady=(2, 14))
@@ -1309,7 +1386,10 @@ def cmd_gui(cfg: Config, dry: bool) -> int:
             moved = True
         if moved:
             logbox.see("end")
-        current_var.set(rot.current.id if rot.current else "idle")
+        if rot.current and rot.current.city:
+            current_var.set(f"{rot.current.city} ({rot.current.country})")
+        else:
+            current_var.set(rot.current.id if rot.current else "idle")
         detail_var.set(f"{rot.backend.name} · {rot.pool().name}")
         root.after(200, drain)
 
@@ -1626,8 +1706,13 @@ def cmd_install(dry: bool) -> int:
     dest_yaml = HOME / "orbit.yaml"
     if sibling.exists() and sibling.resolve() != dest_yaml.resolve():
         shutil.copy2(sibling, dest_yaml)
-    elif not dest_yaml.exists():
+    stale = True
+    if dest_yaml.exists():
+        text = dest_yaml.read_text(encoding="utf-8")
+        stale = "city:" not in text or "IR#1" in text or "Tehran" in text
+    if stale:
         dest_yaml.write_text(BUNDLED_YAML, encoding="utf-8")
+        print("config        wrote city catalog (Proton live list)")
     os.environ["ORBIT_CONFIG"] = str(dest_yaml)
 
     ensure_system_packages()
