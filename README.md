@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>ProtonVPN rotator</b> — Levant, Eurasia, Stateside.<br/>
-  Clock, hotkeys, sentinel. One Python file.
+  Clock, hotkeys, sentinel. One engine, a real app launcher.
 </p>
 
 <p align="center">
@@ -17,18 +17,44 @@
 
 ## Install
 
+**One file, like a desktop IntuneWin** — compressed payload + setup, not for MDM:
+
+```bash
+curl -fL -o Orbit.run https://raw.githubusercontent.com/mikhailtomasovic/orbit/main/dist/Orbit-1.0.0.run
+chmod +x Orbit.run
+./Orbit.run
+```
+
+Or a Debian package:
+
+```bash
+curl -fL -O https://raw.githubusercontent.com/mikhailtomasovic/orbit/main/dist/orbit_1.0.0_all.deb
+sudo apt install ./orbit_1.0.0_all.deb
+```
+
+Or from source:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mikhailtomasovic/orbit/main/install.sh | bash
 ```
 
-That drops `~/.orbit`, the gold icon, a desktop launcher, and `~/.local/bin/orbit`. On a machine with a display it opens the GUI.
-
-Manual:
+After that you **never type `python3 orbit.py`**. Launch **Orbit** from the app menu, or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mikhailtomasovic/orbit/main/orbit.py -o orbit.py
-python3 orbit.py
+orbit
 ```
+
+`orbit.py` is the engine. The `orbit` wrapper is the product: it finds the venv, opens the GUI, and keeps PATH/desktop consistent.
+
+## Launch
+
+| You click / type | What runs |
+|---|---|
+| **Orbit** in KDE/GNOME | `~/.local/bin/orbit` → GUI |
+| `orbit` | GUI (sets up on first run) |
+| `orbit hop` | next city |
+| `orbit --dry-run gui` | window, no Proton |
+| `orbit stop` | stop rotator |
 
 ## What it does
 
@@ -49,29 +75,15 @@ US exits are opt-in and only **Los Angeles** or **Denver**. Iran is not on Proto
 
 Hops call `protonvpn connect --city …` (Proton keeps a single NetworkManager profile).
 
-## Commands
-
-```bash
-orbit                  # install + GUI
-orbit gui              # window
-orbit --dry-run gui    # no real VPN
-orbit test-clock       # prove a GUI hop resets the timer
-orbit start            # daemon, no window
-orbit hop / hop --prev
-orbit status
-orbit nm               # UPLINK / VPN / LEAK
-orbit stop
-```
-
-Sign in once: `protonvpn signin`
-
 ## Layout
 
 ```
+~/.local/bin/orbit     launcher (this is the app)
 ~/.orbit/
-  orbit.py
+  orbit.py             engine
   orbit.yaml
   orbit.png
   venv/
-  tunnels/          # optional WireGuard exports
 ```
+
+Rebuild packages: `bash packaging/build.sh` → `dist/Orbit-1.0.0.run` and `dist/orbit_1.0.0_all.deb`.

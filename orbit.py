@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 APP = "orbit"
+VERSION = "1.0.0"
 HOME = Path(os.environ.get("ORBIT_HOME", Path.home() / ".orbit"))
 VENV = HOME / "venv"
 LOCK_PATH = HOME / "orbit.pid"
@@ -1828,6 +1829,43 @@ def install_icon(src: Path) -> Path | None:
     return dest
 
 
+WRAPPER_SH = r'''#!/usr/bin/env bash
+# Orbit launcher — do not run orbit.py directly.
+set -euo pipefail
+DEST="${ORBIT_HOME:-__DEST__}"
+SCRIPT="$DEST/orbit.py"
+PY="$DEST/venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="$(command -v python3)"
+fi
+if [[ ! -f "$SCRIPT" ]]; then
+  printf 'Orbit is not installed. Run the installer first.\n' >&2
+  exit 1
+fi
+if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+  exec "$PY" "$SCRIPT" --version
+fi
+if [[ $# -eq 0 ]]; then
+  if [[ ! -x "$DEST/venv/bin/python" ]]; then
+    python3 "$SCRIPT" setup
+    PY="$DEST/venv/bin/python"
+    [[ -x "$PY" ]] || PY="$(command -v python3)"
+  fi
+  exec "$PY" "$SCRIPT" gui
+fi
+exec "$PY" "$SCRIPT" "$@"
+'''
+
+
+def write_wrapper() -> Path:
+    bin_dir = Path(os.environ.get("XDG_BIN_HOME", Path.home() / ".local" / "bin"))
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    path = bin_dir / "orbit"
+    path.write_text(WRAPPER_SH.replace("__DEST__", str(HOME)), encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Path | None:
     interp = str(interpreter) if interpreter else ("python" if os.name == "nt" else "python3")
     desk = desktop_dir()
@@ -1859,19 +1897,26 @@ def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Pa
     desktop = apps / "orbit.desktop"
     icon = HOME / "orbit.png"
     icon_line = f"Icon={icon}" if icon.exists() else "Icon=orbit"
+    wrapper = Path(os.environ.get("XDG_BIN_HOME", Path.home() / ".local" / "bin")) / "orbit"
+    if wrapper.exists():
+        exec_line = f"Exec={wrapper}"
+    else:
+        exec_line = f'Exec="{interp}" "{py_path}" gui'
     desktop.write_text(
         "\n".join(
             [
                 "[Desktop Entry]",
                 "Type=Application",
                 "Name=Orbit",
-                "Comment=ProtonVPN rotator",
-                f'Exec="{interp}" "{py_path}" gui',
+                "GenericName=VPN Rotator",
+                "Comment=ProtonVPN rotator — Levant, Eurasia, Stateside",
+                exec_line,
                 icon_line,
                 "Terminal=false",
                 "StartupNotify=true",
+                "StartupWMClass=Orbit",
                 "Categories=Network;Security;",
-                "Keywords=vpn;proton;wireguard;",
+                "Keywords=vpn;proton;wireguard;orbit;",
                 "",
             ]
         ),
@@ -1880,7 +1925,7 @@ def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Pa
     return desktop
 
 
-def cmd_install(dry: bool) -> int:
+def cmd_prepare() -> tuple[Path, Path]:
     if sys.version_info < (3, 10):
         raise SystemExit("Orbit needs Python 3.10 or newer.")
     HOME.mkdir(parents=True, exist_ok=True)
@@ -1904,21 +1949,27 @@ def cmd_install(dry: bool) -> int:
         dest_yaml.write_text(BUNDLED_YAML, encoding="utf-8")
         print("config        wrote city catalog (Proton live list)")
     os.environ["ORBIT_CONFIG"] = str(dest_yaml)
-
     ensure_system_packages()
     py = ensure_venv()
     ensure_pynput(py)
     if not in_orbit_venv():
         print(f"python        switching to {py}")
         os.execv(str(py), [str(py), str(dest_py), *sys.argv[1:]])
-
+    wrapper = write_wrapper()
+    print(f"launcher      {wrapper}")
     shortcut = write_desktop_launcher(dest_py, py)
     if shortcut:
         print(f"shortcut      {shortcut}")
     cfg = load_cfg(dest_yaml)
     cmd_bootstrap(cfg)
+    print(f"installed     {HOME}  v{VERSION}")
+    return dest_py, dest_yaml
+
+
+def cmd_install(dry: bool) -> int:
+    dest_py, dest_yaml = cmd_prepare()
+    cfg = load_cfg(dest_yaml)
     print()
-    print(f"installed     {HOME}")
     if want_gui():
         if which("konsole") and not os.environ.get("KONSOLE_VERSION"):
             print("starting      Konsole")
@@ -1933,8 +1984,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orbit", description="ProtonVPN rotator — clock, hotkeys, sentinel")
     p.add_argument("--config", help="Path to orbit.yaml")
     p.add_argument("--dry-run", action="store_true", help="Log hops without calling a VPN backend")
+    p.add_argument("--version", action="version", version=f"Orbit {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=False)
     sub.add_parser("install", help="Copy to ~/.orbit, make a shortcut, and start")
+    sub.add_parser("setup", help="Install files and launcher without starting")
     sub.add_parser("gui", help="Open the Orbit window")
     sub.add_parser("konsole", help="Open Orbit in Konsole")
     sub.add_parser("start", help="Run the daemon")
@@ -1960,6 +2013,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_test_clock()
     if args.cmd == "konsole":
         return cmd_konsole()
+    if args.cmd == "setup":
+        cmd_prepare()
+        return 0
     if args.cmd in (None, "install"):
         return cmd_install(bool(args.dry_run))
     cfg = load_cfg(resolve_config_path(args.config))
