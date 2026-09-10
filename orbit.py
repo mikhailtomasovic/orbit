@@ -1826,6 +1826,9 @@ def install_icon(src: Path) -> Path | None:
         folder.mkdir(parents=True, exist_ok=True)
         shutil.copy2(dest, folder / name)
     return dest
+
+
+def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Path | None:
     interp = str(interpreter) if interpreter else ("python" if os.name == "nt" else "python3")
     desk = desktop_dir()
     if os.name == "nt":
