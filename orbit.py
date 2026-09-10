@@ -500,9 +500,133 @@ def which(cmd: str) -> str | None:
     return _which(cmd)
 
 
-def run(cmd: list[str], timeout: int = 45) -> subprocess.CompletedProcess[str]:
-    log("sys", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+def run(cmd: list[str], timeout: int = 45, quiet: bool = False) -> subprocess.CompletedProcess[str]:
+    if not quiet:
+        log("sys", " ".join(cmd))
+    env = {**os.environ, "PAGER": "cat", "SYSTEMD_PAGER": "cat", "GIT_PAGER": "cat"}
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+
+
+@dataclass
+class NmConn:
+    name: str
+    uuid: str
+    type: str
+    device: str = ""
+
+    @property
+    def role(self) -> str:
+        n, d, t = self.name.lower(), self.device.lower(), self.type.lower()
+        if n.startswith("pvpn-killswitch") or d.startswith("ipv6leakintrf"):
+            return "LEAK"
+        if t == "wireguard" and (d == "proton0" or n.startswith("protonvpn")):
+            return "VPN"
+        if t in {"802-11-wireless", "wifi", "802-3-ethernet", "ethernet", "gsm"}:
+            return "UPLINK"
+        return "OTHER"
+
+
+def nmcli(*args: str, timeout: int = 20, quiet: bool = False) -> subprocess.CompletedProcess[str]:
+    if not which("nmcli"):
+        return subprocess.CompletedProcess(["nmcli", *args], 1, "", "nmcli missing")
+    return run(["nmcli", "-t", "-c", "no", *args], timeout=timeout, quiet=quiet)
+
+
+def _parse_nm_rows(text: str, nfields: int) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(":")
+        if len(parts) < nfields:
+            continue
+        rows.append(parts[: nfields - 1] + [":".join(parts[nfields - 1 :])])
+    return rows
+
+
+def nm_connections(active: bool = False, quiet: bool = False) -> list[NmConn]:
+    args = ["-f", "NAME,UUID,TYPE,DEVICE", "connection", "show"]
+    if active:
+        args.append("--active")
+    r = nmcli(*args, quiet=quiet)
+    if r.returncode != 0:
+        return []
+    out: list[NmConn] = []
+    for parts in _parse_nm_rows(r.stdout, 4):
+        name, uuid, typ, dev = (parts + ["", "", "", ""])[:4]
+        out.append(NmConn(name=name, uuid=uuid, type=typ, device=dev))
+    return out
+
+
+def nm_active() -> list[NmConn]:
+    return nm_connections(active=True, quiet=True)
+
+
+def proton_nm_profiles() -> list[NmConn]:
+    seen: set[str] = set()
+    out: list[NmConn] = []
+    for c in nm_connections():
+        if c.type != "wireguard":
+            continue
+        if not (c.name.lower().startswith("protonvpn") or c.device == "proton0"):
+            continue
+        if c.uuid in seen:
+            continue
+        seen.add(c.uuid)
+        out.append(c)
+    return out
+
+
+def get_active_proton_profile() -> NmConn | None:
+    for c in nm_active():
+        if c.role == "VPN":
+            return c
+    return None
+
+
+def nm_profile_for(server: Server) -> NmConn | None:
+    needles = {server.id.upper(), server.community.upper(), server.id.replace("#", "-").upper()}
+    needles.discard("")
+    for c in proton_nm_profiles():
+        hay = c.name.upper()
+        if any(n in hay for n in needles):
+            return c
+    return None
+
+
+def wait_device(dev: str, timeout: float = 18) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(c.device == dev for c in nm_active()):
+            return True
+        time.sleep(0.35)
+    return False
+
+
+def default_route_dev() -> str:
+    r = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True, timeout=5)
+    text = r.stdout or ""
+    if "dev " in text:
+        return text.split("dev ", 1)[1].split()[0]
+    return ""
+
+
+def print_nm_state() -> None:
+    if not which("nmcli"):
+        print("nmcli         missing")
+        return
+    active = nm_active()
+    print(f"nm_active     {len(active)}")
+    for c in active:
+        print(f"  {c.role:8} {c.name}  type={c.type}  dev={c.device or '-'}  {c.uuid[:8]}")
+    profiles = proton_nm_profiles()
+    print(f"nm_proton     {len(profiles)} saved WireGuard profiles")
+    active_ids = {c.uuid for c in active}
+    for p in profiles[:24]:
+        mark = " *" if p.uuid in active_ids or p.device == "proton0" else ""
+        print(f"  {p.name}{mark}")
+    if len(profiles) > 24:
+        print(f"  … {len(profiles) - 24} more")
 
 
 class ProtonOfficial:
@@ -512,16 +636,41 @@ class ProtonOfficial:
         return which("protonvpn") or which("protonvpn-cli") or "protonvpn"
 
     def connect(self, server: Server) -> None:
-        r = run([self._bin(), "connect", server.id])
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "connect failed")
+        profile = nm_profile_for(server)
+        if profile:
+            r = nmcli("connection", "up", "uuid", profile.uuid, timeout=45)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip() or r.stdout.strip() or f"nmcli up {profile.name} failed")
+            log("link", f"nmcli up {profile.name}")
+        else:
+            r = run([self._bin(), "connect", server.id], timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "connect failed")
+        if which("nmcli") and not wait_device("proton0"):
+            log("sys", "proton0 did not appear — tunnel may still be coming up")
+        route = default_route_dev()
+        if route and route != "proton0":
+            log("sys", f"default route dev={route} (expected proton0)")
+        active = get_active_proton_profile()
+        if active:
+            log("link", f"active {active.name} on {active.device}")
 
     def disconnect(self) -> None:
+        active = get_active_proton_profile()
+        if active:
+            nmcli("connection", "down", "uuid", active.uuid)
         run([self._bin(), "disconnect"])
 
     def status_text(self) -> str:
+        bits = []
+        active = get_active_proton_profile()
+        if active:
+            bits.append(f"{active.name} dev={active.device}")
         r = run([self._bin(), "status"], timeout=20)
-        return (r.stdout or r.stderr).strip()
+        cli = (r.stdout or r.stderr).strip()
+        if cli:
+            bits.append(cli)
+        return " | ".join(bits) or "protonvpn idle"
 
 
 class ProtonCommunity:
@@ -662,6 +811,8 @@ def proton_cli() -> str | None:
 
 
 def proton_signed_in() -> bool:
+    if get_active_proton_profile():
+        return True
     binary = proton_cli()
     if not binary:
         return False
@@ -677,11 +828,11 @@ def pick_backend(cfg: Config, dry: bool) -> Backend:
         return DryRun()
     kind = cfg.backend
     if kind == "auto":
-        if proton_cli():
-            if proton_signed_in():
+        if proton_cli() or get_active_proton_profile() or proton_nm_profiles():
+            if proton_signed_in() or get_active_proton_profile():
                 kind = "protonvpn-cli"
             else:
-                log("sys", f"{proton_cli()} installed — sign in with: protonvpn signin")
+                log("sys", f"{proton_cli() or 'protonvpn'} installed — sign in with: protonvpn signin")
                 kind = ""
         elif (which("wg-quick") or which("wireguard")) and has_tunnel_files(cfg, ".conf"):
             kind = "wireguard"
@@ -1212,6 +1363,7 @@ def cmd_status(cfg: Config, dry: bool) -> int:
         print(STATUS_PATH.read_text(encoding="utf-8"))
     backend = pick_backend(cfg, dry)
     print(backend.status_text())
+    print_nm_state()
     return 0
 
 
@@ -1281,6 +1433,7 @@ def cmd_bootstrap(cfg: Config) -> int:
         print(f"tunnels       {len(missing)} configs missing in {cfg.tunnels_dir}")
     else:
         print("tunnels       all configs present")
+    print_nm_state()
     return 0
 
 
@@ -1514,6 +1667,7 @@ def build_parser() -> argparse.ArgumentParser:
     hop.add_argument("--prev", action="store_true")
     sub.add_parser("disconnect", help="Tear down the tunnel")
     sub.add_parser("status", help="Show last hop + backend status")
+    sub.add_parser("nm", help="Show NetworkManager Proton / uplink / leak roles")
     sub.add_parser("probe", help="Run sentinel probes once")
     sub.add_parser("stop", help="Stop a running daemon")
     sub.add_parser("validate", help="Print parsed config")
@@ -1543,6 +1697,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "status":
         return cmd_status(cfg, dry)
+    if args.cmd == "nm":
+        print_nm_state()
+        return 0
     if args.cmd == "probe":
         return cmd_probe(cfg)
     if args.cmd == "validate":
