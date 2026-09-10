@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import json
 import os
+import queue
 import random
 import re
 import shutil
@@ -421,6 +422,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
 # ---------------------------------------------------------------------------
 
 _print_lock = threading.Lock()
+_gui_queue: queue.Queue[str] | None = None
 
 
 def log(kind: str, message: str) -> None:
@@ -431,6 +433,11 @@ def log(kind: str, message: str) -> None:
         HOME.mkdir(parents=True, exist_ok=True)
         with LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+    if _gui_queue is not None:
+        try:
+            _gui_queue.put_nowait(line)
+        except Exception:
+            pass
 
 
 def write_status(payload: dict[str, Any]) -> None:
@@ -974,33 +981,10 @@ def load_cfg(path: Path) -> Config:
 
 
 def cmd_start(cfg: Config, dry: bool) -> int:
-    acquire_lock()
-    rot = Rotator(cfg=cfg, backend=pick_backend(cfg, dry))
-    log("sys", f"backend={rot.backend.name}  pool={rot.pool().name}  n={len(rot.pool().servers)}")
-    rot.hop("start")
-
-    threads: list[threading.Thread] = []
-    if cfg.schedule_enabled:
-        threads.append(threading.Thread(target=clock_loop, args=(rot,), daemon=True, name="clock"))
-    if cfg.sentinel_enabled and cfg.probes:
-        threads.append(threading.Thread(target=sentinel_loop, args=(rot,), daemon=True, name="sentinel"))
-    for t in threads:
-        t.start()
-    listener = start_hotkeys(rot) if cfg.hotkeys_enabled else None
+    rot, listener = spawn_rotator(cfg, dry)
 
     def shutdown(*_args: Any) -> None:
-        log("sys", "stopping")
-        rot.stop.set()
-        try:
-            rot.disconnect()
-        except Exception as exc:
-            log("sys", str(exc))
-        if listener:
-            try:
-                listener.stop()
-            except Exception:
-                pass
-        release_lock()
+        teardown_rotator(rot, listener)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -1010,6 +994,200 @@ def cmd_start(cfg: Config, dry: bool) -> int:
             pass
     finally:
         shutdown()
+    return 0
+
+
+def spawn_rotator(cfg: Config, dry: bool) -> tuple[Rotator, Any]:
+    acquire_lock()
+    rot = Rotator(cfg=cfg, backend=pick_backend(cfg, dry))
+    log("sys", f"backend={rot.backend.name}  pool={rot.pool().name}  n={len(rot.pool().servers)}")
+    rot.hop("start")
+    if cfg.schedule_enabled:
+        threading.Thread(target=clock_loop, args=(rot,), daemon=True, name="clock").start()
+    if cfg.sentinel_enabled and cfg.probes:
+        threading.Thread(target=sentinel_loop, args=(rot,), daemon=True, name="sentinel").start()
+    listener = start_hotkeys(rot) if cfg.hotkeys_enabled else None
+    return rot, listener
+
+
+def teardown_rotator(rot: Rotator, listener: Any) -> None:
+    log("sys", "stopping")
+    rot.stop.set()
+    try:
+        rot.disconnect()
+    except Exception as exc:
+        log("sys", str(exc))
+    if listener:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+    release_lock()
+
+
+def want_gui() -> bool:
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def ensure_tk() -> None:
+    try:
+        import tkinter  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+    if which("apt-get"):
+        ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        sudo_run(["sudo", "apt-get", "install", "-y", "python3-tk", f"python{ver}-tk"])
+
+
+def cmd_gui(cfg: Config, dry: bool) -> int:
+    global _gui_queue
+    ensure_tk()
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+        from tkinter import ttk
+    except ImportError:
+        print("deps          python3-tk missing — install it and re-run")
+        return cmd_start(cfg, dry)
+
+    if LOCK_PATH.exists():
+        try:
+            pid = int(LOCK_PATH.read_text().strip() or "0")
+            if pid and pid != os.getpid():
+                os.kill(pid, 0)
+                stop_daemon()
+                time.sleep(0.5)
+        except (ProcessLookupError, ValueError, OSError):
+            LOCK_PATH.unlink(missing_ok=True)
+
+    _gui_queue = queue.Queue()
+    rot, listener = spawn_rotator(cfg, dry)
+
+    bg, raised, fg, muted, accent = "#12110f", "#1c1a17", "#ece8e1", "#9a9186", "#c4a574"
+    root = tk.Tk()
+    root.title("Orbit")
+    root.configure(bg=bg)
+    root.minsize(520, 560)
+    root.geometry("640x720")
+    try:
+        root.tk.call("tk", "scaling", 1.15)
+    except tk.TclError:
+        pass
+
+    family = "Noto Sans"
+    available = set(tkfont.families())
+    for candidate in ("IBM Plex Sans", "Noto Sans", "DejaVu Sans"):
+        if candidate in available:
+            family = candidate
+            break
+
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("TFrame", background=bg)
+    style.configure("Card.TFrame", background=raised)
+    style.configure("TLabel", background=bg, foreground=fg, font=(family, 11))
+    style.configure("Muted.TLabel", background=bg, foreground=muted, font=(family, 9))
+    style.configure("Display.TLabel", background=bg, foreground=fg, font=(family, 22))
+    style.configure("TButton", font=(family, 10), padding=8)
+    style.configure("Accent.TButton", font=(family, 10, "bold"), padding=8)
+
+    outer = ttk.Frame(root, style="TFrame")
+    outer.pack(fill="both", expand=True, padx=20, pady=18)
+
+    ttk.Label(outer, text="ORBIT", style="Muted.TLabel").pack(anchor="w")
+    current_var = tk.StringVar(value=rot.current.id if rot.current else "idle")
+    ttk.Label(outer, textvariable=current_var, style="Display.TLabel").pack(anchor="w", pady=(4, 0))
+    detail_var = tk.StringVar(value=f"{rot.backend.name} · {rot.pool().name}")
+    ttk.Label(outer, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w", pady=(2, 14))
+
+    btns = ttk.Frame(outer, style="TFrame")
+    btns.pack(fill="x")
+
+    def bg_call(fn: Any) -> None:
+        threading.Thread(target=fn, daemon=True).start()
+
+    ttk.Button(btns, text="Hop", style="Accent.TButton", command=lambda: bg_call(lambda: rot.hop("key", 1))).pack(
+        side="left", padx=(0, 8)
+    )
+    ttk.Button(btns, text="Prev", command=lambda: bg_call(lambda: rot.hop("key", -1))).pack(side="left", padx=(0, 8))
+    ttk.Button(btns, text="Disconnect", command=lambda: bg_call(rot.disconnect)).pack(side="left", padx=(0, 8))
+    ttk.Button(btns, text="Reconnect", command=lambda: bg_call(lambda: rot.hop("key", 1))).pack(side="left")
+
+    ttk.Label(outer, text="POOL", style="Muted.TLabel").pack(anchor="w", pady=(18, 6))
+    pools = ttk.Frame(outer, style="TFrame")
+    pools.pack(fill="x")
+
+    def set_pool(name: str) -> None:
+        rot.cfg.active_pool = name
+        log("key", f"pool {name}")
+        bg_call(lambda: rot.hop("key", 1))
+
+    for pool in rot.cfg.pools:
+        ttk.Button(pools, text=pool.name, command=lambda n=pool.name: set_pool(n)).pack(side="left", padx=(0, 8))
+
+    ttk.Label(outer, text="LOG", style="Muted.TLabel").pack(anchor="w", pady=(18, 6))
+    logbox = tk.Text(
+        outer,
+        height=18,
+        bg=raised,
+        fg=fg,
+        insertbackground=fg,
+        relief="flat",
+        wrap="word",
+        font=("IBM Plex Mono", 9) if "IBM Plex Mono" in available else ("monospace", 9),
+        highlightthickness=0,
+        padx=10,
+        pady=10,
+    )
+    logbox.pack(fill="both", expand=True)
+    logbox.tag_configure("muted", foreground=muted)
+
+    def drain() -> None:
+        moved = False
+        while _gui_queue is not None:
+            try:
+                line = _gui_queue.get_nowait()
+            except queue.Empty:
+                break
+            logbox.insert("end", line + "\n")
+            moved = True
+        if moved:
+            logbox.see("end")
+        current_var.set(rot.current.id if rot.current else "idle")
+        detail_var.set(f"{rot.backend.name} · {rot.pool().name}")
+        root.after(200, drain)
+
+    def on_close() -> None:
+        teardown_rotator(rot, listener)
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.after(100, drain)
+    log("sys", "GUI up")
+    try:
+        root.mainloop()
+    finally:
+        if not rot.stop.is_set():
+            teardown_rotator(rot, listener)
+        _gui_queue = None
+    return 0
+
+
+def cmd_konsole() -> int:
+    py = venv_python() if venv_python().exists() else Path(sys.executable)
+    script = HOME / "orbit.py" if (HOME / "orbit.py").exists() else Path(__file__).resolve()
+    konsole = which("konsole")
+    if not konsole:
+        print("konsole not found")
+        return 1
+    cmd = [konsole, "--title", "Orbit", "-e", str(py), str(script), "gui"]
+    print(" ".join(cmd))
+    subprocess.Popen(cmd, start_new_session=True)
     return 0
 
 
@@ -1212,6 +1390,7 @@ def ensure_system_packages() -> None:
     if which("apt-get"):
         ensure_proton_apt_repo()
         sudo_run(["sudo", "apt-get", "install", "-y", "wireguard"])
+        sudo_run(["sudo", "apt-get", "install", "-y", "python3-tk", f"python{sys.version_info.major}.{sys.version_info.minor}-tk"])
         if not proton_cli():
             r = sudo_run(["sudo", "apt-get", "install", "-y", "proton-vpn-cli"])
             if r.returncode != 0 and which("snap"):
@@ -1270,8 +1449,8 @@ def write_desktop_launcher(py_path: Path, interpreter: Path | None = None) -> Pa
                 "Type=Application",
                 "Name=Orbit",
                 "Comment=ProtonVPN rotator",
-                f'Exec="{interp}" "{py_path}"',
-                "Terminal=true",
+                f'Exec="{interp}" "{py_path}" gui',
+                "Terminal=false",
                 "Categories=Network;",
                 "",
             ]
@@ -1312,6 +1491,12 @@ def cmd_install(dry: bool) -> int:
     cmd_bootstrap(cfg)
     print()
     print(f"installed     {HOME}")
+    if want_gui():
+        if which("konsole") and not os.environ.get("KONSOLE_VERSION"):
+            print("starting      Konsole")
+            return cmd_konsole()
+        print("starting      GUI")
+        return cmd_gui(cfg, dry)
     print("starting      Ctrl+C stops")
     return cmd_start(cfg, dry)
 
@@ -1322,6 +1507,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Log hops without calling a VPN backend")
     sub = p.add_subparsers(dest="cmd", required=False)
     sub.add_parser("install", help="Copy to ~/.orbit, make a shortcut, and start")
+    sub.add_parser("gui", help="Open the Orbit window")
+    sub.add_parser("konsole", help="Open Orbit in Konsole")
     sub.add_parser("start", help="Run the daemon")
     hop = sub.add_parser("hop", help="Hop once")
     hop.add_argument("--prev", action="store_true")
@@ -1339,10 +1526,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "stop":
         return stop_daemon()
+    if args.cmd == "konsole":
+        return cmd_konsole()
     if args.cmd in (None, "install"):
         return cmd_install(bool(args.dry_run))
     cfg = load_cfg(resolve_config_path(args.config))
     dry = bool(args.dry_run)
+    if args.cmd == "gui":
+        return cmd_gui(cfg, dry)
     if args.cmd == "start":
         return cmd_start(cfg, dry)
     if args.cmd == "hop":
